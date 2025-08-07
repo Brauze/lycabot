@@ -6,16 +6,21 @@
 
 require_once 'config.php';
 require_once 'lyca_api.php';
+require_once 'vendor/autoload.php';
+
+use Twilio\Rest\Client;
 
 class LycaPayBot {
     private $config;
     private $db;
     private $user;
     private $session;
+    private $twilio;
     
     public function __construct() {
         $this->config = Config::getInstance();
         $this->db = $this->config->getDatabase();
+        $this->twilio = new Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
     }
     
     /**
@@ -23,10 +28,14 @@ class LycaPayBot {
      */
     public function processMessage($from, $message, $messageId = null) {
         try {
+            $startTime = microtime(true);
             Logger::info("Processing message from $from: $message");
             
+            // Clean phone number
+            $from = $this->cleanPhoneNumber($from);
+            
             // Log incoming message
-            $this->logMessage($from, 'incoming', $message);
+            $this->logMessage($from, 'incoming', $message, null, $messageId);
             
             // Get or create user
             $this->user = $this->getOrCreateUser($from);
@@ -44,7 +53,8 @@ class LycaPayBot {
             // Send response
             if ($response) {
                 $this->sendMessage($from, $response);
-                $this->logMessage($from, 'outgoing', $response);
+                $processingTime = round((microtime(true) - $startTime) * 1000);
+                $this->logMessage($from, 'outgoing', $response, $processingTime);
             }
             
             // Update user activity
@@ -57,6 +67,176 @@ class LycaPayBot {
             ]);
             $this->sendMessage($from, "Sorry, I encountered an error. Please try again later or contact support.");
         }
+    }
+    
+    /**
+     * Send WhatsApp message via Twilio
+     */
+    private function sendMessage($to, $message) {
+        try {
+            $this->twilio->messages->create(
+                'whatsapp:' . $to,
+                [
+                    'from' => TWILIO_WHATSAPP_NUMBER,
+                    'body' => $message
+                ]
+            );
+            Logger::info("Message sent successfully", ['to' => $to]);
+        } catch (Exception $e) {
+            Logger::error("Failed to send message: " . $e->getMessage(), ['to' => $to]);
+            throw $e;
+        }
+    }
+    
+    /**
+     * Get or create user
+     */
+    private function getOrCreateUser($phoneNumber) {
+        try {
+            $stmt = $this->db->prepare("SELECT * FROM users WHERE phone_number = ?");
+            $stmt->execute([$phoneNumber]);
+            $user = $stmt->fetch();
+            
+            if (!$user) {
+                // Create new user
+                $stmt = $this->db->prepare("
+                    INSERT INTO users (phone_number, registration_date, last_activity, status) 
+                    VALUES (?, NOW(), NOW(), 'active')
+                ");
+                $stmt->execute([$phoneNumber]);
+                
+                $userId = $this->db->lastInsertId();
+                
+                // Get the created user
+                $stmt = $this->db->prepare("SELECT * FROM users WHERE id = ?");
+                $stmt->execute([$userId]);
+                $user = $stmt->fetch();
+                
+                Logger::info("New user created", ['phone' => $phoneNumber, 'id' => $userId]);
+            }
+            
+            return $user;
+        } catch (Exception $e) {
+            Logger::error("Error getting/creating user: " . $e->getMessage());
+            throw $e;
+        }
+    }
+    
+    /**
+     * Get user session
+     */
+    private function getUserSession($userId) {
+        try {
+            $stmt = $this->db->prepare("
+                SELECT * FROM bot_sessions 
+                WHERE user_id = ? AND (expires_at IS NULL OR expires_at > NOW())
+            ");
+            $stmt->execute([$userId]);
+            $session = $stmt->fetch();
+            
+            if (!$session) {
+                // Create new session
+                $expiresAt = date('Y-m-d H:i:s', time() + SESSION_TIMEOUT);
+                $stmt = $this->db->prepare("
+                    INSERT INTO bot_sessions (user_id, session_state, expires_at, created_date, updated_date) 
+                    VALUES (?, 'idle', ?, NOW(), NOW())
+                    ON DUPLICATE KEY UPDATE 
+                    session_state = 'idle', expires_at = ?, updated_date = NOW()
+                ");
+                $stmt->execute([$userId, $expiresAt, $expiresAt]);
+                
+                // Get the created session
+                $stmt = $this->db->prepare("SELECT * FROM bot_sessions WHERE user_id = ?");
+                $stmt->execute([$userId]);
+                $session = $stmt->fetch();
+            }
+            
+            return $session;
+        } catch (Exception $e) {
+            Logger::error("Error getting user session: " . $e->getMessage());
+            throw $e;
+        }
+    }
+    
+    /**
+     * Update user session
+     */
+    private function updateSession($userId, $state, $action = null, $data = []) {
+        try {
+            $expiresAt = date('Y-m-d H:i:s', time() + SESSION_TIMEOUT);
+            $sessionData = empty($data) ? null : json_encode($data);
+            
+            $stmt = $this->db->prepare("
+                UPDATE bot_sessions 
+                SET session_state = ?, current_action = ?, session_data = ?, expires_at = ?, updated_date = NOW()
+                WHERE user_id = ?
+            ");
+            $stmt->execute([$state, $action, $sessionData, $expiresAt, $userId]);
+            
+            // Update local session
+            $this->session['session_state'] = $state;
+            $this->session['current_action'] = $action;
+            $this->session['session_data'] = $sessionData;
+            
+        } catch (Exception $e) {
+            Logger::error("Error updating session: " . $e->getMessage());
+            throw $e;
+        }
+    }
+    
+    /**
+     * Clear user session
+     */
+    private function clearUserSession($userId) {
+        try {
+            $stmt = $this->db->prepare("
+                UPDATE bot_sessions 
+                SET session_state = 'idle', current_action = NULL, session_data = NULL, updated_date = NOW()
+                WHERE user_id = ?
+            ");
+            $stmt->execute([$userId]);
+        } catch (Exception $e) {
+            Logger::error("Error clearing session: " . $e->getMessage());
+        }
+    }
+    
+    /**
+     * Log message
+     */
+    private function logMessage($phoneNumber, $type, $content, $processingTime = null, $webhookData = null) {
+        try {
+            $userId = $this->user['id'] ?? null;
+            $webhookJson = $webhookData ? json_encode($webhookData) : null;
+            
+            $stmt = $this->db->prepare("
+                INSERT INTO message_logs (user_id, phone_number, message_type, message_content, webhook_data, processing_time_ms, created_date)
+                VALUES (?, ?, ?, ?, ?, ?, NOW())
+            ");
+            $stmt->execute([$userId, $phoneNumber, $type, $content, $webhookJson, $processingTime]);
+        } catch (Exception $e) {
+            Logger::error("Error logging message: " . $e->getMessage());
+        }
+    }
+    
+    /**
+     * Update user activity
+     */
+    private function updateUserActivity($userId) {
+        try {
+            $stmt = $this->db->prepare("UPDATE users SET last_activity = NOW() WHERE id = ?");
+            $stmt->execute([$userId]);
+        } catch (Exception $e) {
+            Logger::error("Error updating user activity: " . $e->getMessage());
+        }
+    }
+    
+    /**
+     * Clean phone number
+     */
+    private function cleanPhoneNumber($phone) {
+        // Remove 'whatsapp:' prefix and other prefixes
+        $phone = str_replace(['whatsapp:', '+'], '', $phone);
+        return Utils::formatPhoneNumber($phone);
     }
     
     /**
@@ -184,12 +364,34 @@ class LycaPayBot {
     }
     
     /**
+     * Check balance
+     */
+    private function checkBalance() {
+        try {
+            $lycaApi = new LycaMobileAPI();
+            $balance = $lycaApi->getWalletBalance();
+            
+            if ($balance && isset($balance['walletBalance'])) {
+                return "💳 *Your Wallet Balance*\n\n" .
+                       "💰 Available: " . Utils::formatCurrency($balance['walletBalance']) . "\n" .
+                       "📅 Last Updated: " . date('Y-m-d H:i:s') . "\n\n" .
+                       "Send 'menu' to continue 🏠";
+            } else {
+                return "❌ Could not retrieve balance at this time. Please try again later.";
+            }
+        } catch (Exception $e) {
+            Logger::error("Error checking balance: " . $e->getMessage());
+            return "❌ Could not check balance. Please try again or contact support.";
+        }
+    }
+    
+    /**
      * Show available bundles
      */
     private function showBundles() {
         try {
             $lycaApi = new LycaMobileAPI();
-            $plans = $lycaApi->getFloatEnabledPlans();
+            $plans = $lycaApi->getEbalanceSupportedPlans();
             
             if (empty($plans)) {
                 return "❌ Sorry, no data bundles are available at the moment. Please try again later.";
@@ -218,6 +420,48 @@ class LycaPayBot {
         } catch (Exception $e) {
             Logger::error("Error fetching bundles: " . $e->getMessage());
             return "❌ Could not load bundles. Please try again later or contact support.";
+        }
+    }
+    
+    /**
+     * Get customer saved numbers
+     */
+    private function getCustomerNumbers($userId) {
+        try {
+            $stmt = $this->db->prepare("
+                SELECT subscription_id, subscriber_name, subscriber_surname 
+                FROM customer_subscriptions 
+                WHERE user_id = ? AND status = 'active'
+                ORDER BY is_primary DESC, created_date DESC
+                LIMIT 5
+            ");
+            $stmt->execute([$userId]);
+            return $stmt->fetchAll();
+        } catch (Exception $e) {
+            Logger::error("Error getting customer numbers: " . $e->getMessage());
+            return [];
+        }
+    }
+    
+    /**
+     * Save customer number
+     */
+    private function saveCustomerNumber($userId, $subscriptionId, $subscriberName = '') {
+        try {
+            $names = explode(' ', trim($subscriberName), 2);
+            $firstName = $names[0] ?? '';
+            $lastName = $names[1] ?? '';
+            
+            $stmt = $this->db->prepare("
+                INSERT INTO customer_subscriptions (user_id, subscription_id, subscriber_name, subscriber_surname, created_date)
+                VALUES (?, ?, ?, ?, NOW())
+                ON DUPLICATE KEY UPDATE 
+                subscriber_name = VALUES(subscriber_name), 
+                subscriber_surname = VALUES(subscriber_surname)
+            ");
+            $stmt->execute([$userId, $subscriptionId, $firstName, $lastName]);
+        } catch (Exception $e) {
+            Logger::error("Error saving customer number: " . $e->getMessage());
         }
     }
     
@@ -260,8 +504,9 @@ class LycaPayBot {
                            "Select recipient number:\n\n";
                 
                 foreach ($customerNumbers as $index => $number) {
+                    $name = trim(($number['subscriber_name'] ?? '') . ' ' . ($number['subscriber_surname'] ?? ''));
                     $response .= ($index + 1) . "️⃣ " . $number['subscription_id'] . 
-                                " (" . ($number['subscriber_name'] ?: 'Unknown') . ")\n";
+                                " (" . ($name ?: 'Unknown') . ")\n";
                 }
                 
                 $response .= "\n🆕 Enter 'new' for different number\n";
@@ -279,9 +524,7 @@ class LycaPayBot {
         }
     }
     
-    /**
-     * Handle saved number selection for bundle purchase
-     */
+    // Continue with remaining methods...
     private function handleSavedNumberSelection($input, $sessionData) {
         if (strtolower($input) === 'cancel') {
             $this->clearUserSession($this->user['id']);
@@ -289,9 +532,7 @@ class LycaPayBot {
         }
         
         if (strtolower($input) === 'new') {
-            $this->updateSession($this->user['id'], 'awaiting_number', 'bundle_purchase', [
-                'selected_plan' => $sessionData['selected_plan']
-            ]);
+            $this->updateSession($this->user['id'], 'awaiting_number', $sessionData['selected_plan'] ? 'bundle_purchase' : 'airtime_purchase', $sessionData);
             
             return "📱 Please enter the new Uganda mobile number:\n\n" .
                    "📝 *Format Examples:*\n" .
@@ -305,15 +546,17 @@ class LycaPayBot {
         
         if ($selectedIndex >= 0 && $selectedIndex < count($savedNumbers)) {
             $selectedNumber = $savedNumbers[$selectedIndex];
-            return $this->confirmBundlePurchase($sessionData['selected_plan'], $selectedNumber['subscription_id']);
+            
+            if (isset($sessionData['selected_plan'])) {
+                return $this->confirmBundlePurchase($sessionData['selected_plan'], $selectedNumber['subscription_id']);
+            } elseif (isset($sessionData['amount'])) {
+                return $this->confirmAirtimePurchase($sessionData['amount'], $selectedNumber['subscription_id']);
+            }
         }
         
         return "❌ Invalid selection. Please choose a valid number or enter 'new' for a different number.";
     }
     
-    /**
-     * Handle number input
-     */
     private function handleNumberInput($input, $sessionData) {
         if (strtolower($input) === 'cancel') {
             $this->clearUserSession($this->user['id']);
@@ -343,9 +586,6 @@ class LycaPayBot {
         return "❌ Something went wrong. Please start over by sending 'menu'.";
     }
     
-    /**
-     * Confirm bundle purchase
-     */
     private function confirmBundlePurchase($plan, $phoneNumber) {
         try {
             // Get subscriber info
@@ -354,10 +594,10 @@ class LycaPayBot {
             
             $subscriberName = '';
             if ($subscriberInfo && isset($subscriberInfo['subscriberName'])) {
-                $subscriberName = $subscriberInfo['subscriberName'] . ' ' . ($subscriberInfo['subscriberSurname'] ?? '');
+                $subscriberName = trim($subscriberInfo['subscriberName'] . ' ' . ($subscriberInfo['subscriberSurname'] ?? ''));
                 
                 // Save customer number for future use
-                $this->saveCustomerNumber($this->user['id'], $phoneNumber, trim($subscriberName));
+                $this->saveCustomerNumber($this->user['id'], $phoneNumber, $subscriberName);
             }
             
             $response = "🔍 *Purchase Confirmation*\n\n";
@@ -371,21 +611,6 @@ class LycaPayBot {
             
             $response .= "\n📋 *Bundle Details:*\n";
             $response .= $plan['serviceBundleDescription'] . "\n\n";
-            
-            // Check user balance (if implemented)
-            $walletBalance = $this->getUserWalletBalance($this->user['id']);
-            if ($walletBalance !== null) {
-                $response .= "💳 *Your Balance:* " . Utils::formatCurrency($walletBalance) . "\n\n";
-                
-                if ($walletBalance < $plan['serviceBundlePrice']) {
-                    $response .= "❌ *Insufficient balance!*\n";
-                    $response .= "Please top up your wallet or contact support.\n\n";
-                    $response .= "Send 'support' for help or 'menu' to go back.";
-                    
-                    $this->clearUserSession($this->user['id']);
-                    return $response;
-                }
-            }
             
             $response .= "✅ Confirm purchase?\n\n";
             $response .= "1️⃣ *YES* - Proceed with purchase\n";
@@ -406,9 +631,6 @@ class LycaPayBot {
         }
     }
     
-    /**
-     * Handle purchase confirmation
-     */
     private function handlePurchaseConfirmation($input, $sessionData) {
         $input = strtolower(trim($input));
         
@@ -424,9 +646,6 @@ class LycaPayBot {
         return "❓ Please send:\n1️⃣ *YES* to confirm\n2️⃣ *NO* to cancel\n\nOr send 'cancel' to abort.";
     }
     
-    /**
-     * Process bundle purchase
-     */
     private function processBundlePurchase($sessionData) {
         try {
             $plan = $sessionData['plan'];
@@ -447,9 +666,9 @@ class LycaPayBot {
             $lycaApi = new LycaMobileAPI();
             $result = $lycaApi->purchaseBundle($phoneNumber, $plan['serviceBundleToken'], $transactionId);
             
-            if ($result && $result['responseCode'] == 1) {
+            if ($result && isset($result['status']) && $result['status'] === 'SUCCESS') {
                 // Success
-                $this->updateTransactionStatus($transactionId, 'completed', $result);
+                $this->updateTransactionStatus($transactionId, 'success', $result);
                 
                 $response = "✅ *Purchase Successful!* 🎉\n\n";
                 $response .= "📱 *Bundle:* " . $plan['serviceBundleName'] . "\n";
@@ -467,12 +686,12 @@ class LycaPayBot {
                 
             } else {
                 // Failed
-                $errorMsg = $this->getErrorMessage($result['responseCode'] ?? -10017);
+                $errorCode = $result['responseCode'] ?? 'Unknown';
                 $this->updateTransactionStatus($transactionId, 'failed', $result);
                 
                 $response = "❌ *Purchase Failed*\n\n";
                 $response .= "🔢 *Transaction ID:* " . $transactionId . "\n";
-                $response .= "📄 *Reason:* " . $errorMsg . "\n\n";
+                $response .= "📄 *Reason:* " . ErrorCodes::getMessage($errorCode) . "\n\n";
                 $response .= "💡 You can try again or contact support if the issue persists.\n\n";
                 $response .= "Send 'menu' to try again or 'support' for help.";
             }
@@ -489,6 +708,53 @@ class LycaPayBot {
             
             $this->clearUserSession($this->user['id']);
             return "❌ Purchase failed due to a technical error. Please try again later or contact support.\n\nSend 'menu' to start over.";
+        }
+    }
+    
+    /**
+     * Create transaction record
+     */
+    private function createTransaction($userId, $type, $amount, $subscriptionId, $transactionId, $metadata = []) {
+        try {
+            $bundleToken = $metadata['bundle_token'] ?? null;
+            
+            $stmt = $this->db->prepare("
+                INSERT INTO transactions (
+                    transaction_id, user_id, subscription_id, transaction_type, 
+                    service_bundle_token, amount, status, created_date
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', NOW())
+            ");
+            
+            $stmt->execute([
+                $transactionId, $userId, $subscriptionId, $type, $bundleToken, $amount
+            ]);
+            
+        } catch (Exception $e) {
+            Logger::error("Error creating transaction: " . $e->getMessage());
+            throw $e;
+        }
+    }
+    
+    /**
+     * Update transaction status
+     */
+    private function updateTransactionStatus($transactionId, $status, $result = null) {
+        try {
+            $lycaTransactionId = $result['transactionId'] ?? null;
+            $errorCode = $result['responseCode'] ?? null;
+            $errorMessage = $result['responseMessage'] ?? null;
+            $completedDate = ($status === 'success') ? date('Y-m-d H:i:s') : null;
+            
+            $stmt = $this->db->prepare("
+                UPDATE transactions 
+                SET status = ?, lyca_transaction_id = ?, error_code = ?, error_message = ?, completed_date = ?
+                WHERE transaction_id = ?
+            ");
+            
+            $stmt->execute([$status, $lycaTransactionId, $errorCode, $errorMessage, $completedDate, $transactionId]);
+            
+        } catch (Exception $e) {
+            Logger::error("Error updating transaction status: " . $e->getMessage());
         }
     }
     
@@ -556,8 +822,9 @@ class LycaPayBot {
             $response .= "Select recipient number:\n\n";
             
             foreach ($customerNumbers as $index => $number) {
+                $name = trim(($number['subscriber_name'] ?? '') . ' ' . ($number['subscriber_surname'] ?? ''));
                 $response .= ($index + 1) . "️⃣ " . $number['subscription_id'] . 
-                            " (" . ($number['subscriber_name'] ?: 'Unknown') . ")\n";
+                            " (" . ($name ?: 'Unknown') . ")\n";
             }
             
             $response .= "\n🆕 Enter 'new' for different number\n";
@@ -583,10 +850,10 @@ class LycaPayBot {
             
             $subscriberName = '';
             if ($subscriberInfo && isset($subscriberInfo['subscriberName'])) {
-                $subscriberName = $subscriberInfo['subscriberName'] . ' ' . ($subscriberInfo['subscriberSurname'] ?? '');
+                $subscriberName = trim($subscriberInfo['subscriberName'] . ' ' . ($subscriberInfo['subscriberSurname'] ?? ''));
                 
                 // Save customer number for future use
-                $this->saveCustomerNumber($this->user['id'], $phoneNumber, trim($subscriberName));
+                $this->saveCustomerNumber($this->user['id'], $phoneNumber, $subscriberName);
             }
             
             $response = "🔍 *Airtime Purchase Confirmation*\n\n";
@@ -595,21 +862,6 @@ class LycaPayBot {
             
             if ($subscriberName) {
                 $response .= "👤 *Subscriber:* " . $subscriberName . "\n";
-            }
-            
-            // Check user balance (if implemented)
-            $walletBalance = $this->getUserWalletBalance($this->user['id']);
-            if ($walletBalance !== null) {
-                $response .= "\n💳 *Your Balance:* " . Utils::formatCurrency($walletBalance) . "\n";
-                
-                if ($walletBalance < $amount) {
-                    $response .= "\n❌ *Insufficient balance!*\n";
-                    $response .= "Please top up your wallet or contact support.\n\n";
-                    $response .= "Send 'support' for help or 'menu' to go back.";
-                    
-                    $this->clearUserSession($this->user['id']);
-                    return $response;
-                }
             }
             
             $response .= "\n✅ Confirm airtime top-up?\n\n";
@@ -670,9 +922,9 @@ class LycaPayBot {
             $lycaApi = new LycaMobileAPI();
             $result = $lycaApi->purchaseAirtime($phoneNumber, $amount, $transactionId);
             
-            if ($result && $result['responseCode'] == 1) {
+            if ($result && isset($result['status']) && $result['status'] === 'SUCCESS') {
                 // Success
-                $this->updateTransactionStatus($transactionId, 'completed', $result);
+                $this->updateTransactionStatus($transactionId, 'success', $result);
                 
                 $response = "✅ *Airtime Top-up Successful!* 🎉\n\n";
                 $response .= "💰 *Amount:* " . Utils::formatCurrency($amount) . "\n";
@@ -689,7 +941,230 @@ class LycaPayBot {
                 
             } else {
                 // Failed
-                $errorMsg = $this->getErrorMessage($result['responseCode'] ?? -10017);
+                $errorCode = $result['responseCode'] ?? 'Unknown';
                 $this->updateTransactionStatus($transactionId, 'failed', $result);
                 
                 $response = "❌ *Airtime Top-up Failed*\n\n";
+                $response .= "🔢 *Transaction ID:* " . $transactionId . "\n";
+                $response .= "📄 *Reason:* " . ErrorCodes::getMessage($errorCode) . "\n\n";
+                $response .= "💡 You can try again or contact support if the issue persists.\n\n";
+                $response .= "Send 'menu' to try again or 'support' for help.";
+            }
+            
+            $this->clearUserSession($this->user['id']);
+            return $response;
+            
+        } catch (Exception $e) {
+            Logger::error("Error processing airtime purchase: " . $e->getMessage());
+            
+            if (isset($transactionId)) {
+                $this->updateTransactionStatus($transactionId, 'failed', ['error' => $e->getMessage()]);
+            }
+            
+            $this->clearUserSession($this->user['id']);
+            return "❌ Airtime top-up failed due to a technical error. Please try again later or contact support.\n\nSend 'menu' to start over.";
+        }
+    }
+    
+    /**
+     * Show transaction history
+     */
+    private function showTransactionHistory() {
+        try {
+            $stmt = $this->db->prepare("
+                SELECT t.*, sb.service_bundle_name 
+                FROM transactions t
+                LEFT JOIN service_bundles sb ON t.service_bundle_token = sb.service_bundle_token
+                WHERE t.user_id = ? 
+                ORDER BY t.created_date DESC 
+                LIMIT 10
+            ");
+            $stmt->execute([$this->user['id']]);
+            $transactions = $stmt->fetchAll();
+            
+            if (empty($transactions)) {
+                return "📊 *Transaction History*\n\n" .
+                       "No transactions found yet.\n\n" .
+                       "Start making purchases to see your history here!\n\n" .
+                       "Send 'menu' to go back 🏠";
+            }
+            
+            $response = "📊 *Your Transaction History*\n\n";
+            
+            foreach ($transactions as $transaction) {
+                $statusIcon = $this->getStatusIcon($transaction['status']);
+                $response .= "{$statusIcon} *" . ucfirst($transaction['transaction_type']) . "*\n";
+                
+                if ($transaction['transaction_type'] === 'bundle' && $transaction['service_bundle_name']) {
+                    $response .= "   📱 " . $transaction['service_bundle_name'] . "\n";
+                }
+                
+                $response .= "   💰 " . Utils::formatCurrency($transaction['amount']) . "\n";
+                $response .= "   📞 " . $transaction['subscription_id'] . "\n";
+                $response .= "   📅 " . date('M d, Y H:i', strtotime($transaction['created_date'])) . "\n";
+                
+                if ($transaction['status'] === 'failed' && $transaction['error_message']) {
+                    $response .= "   ❌ " . $transaction['error_message'] . "\n";
+                }
+                
+                $response .= "\n";
+            }
+            
+            $response .= "💡 Showing last 10 transactions\n";
+            $response .= "Send 'menu' to go back 🏠";
+            
+            return $response;
+            
+        } catch (Exception $e) {
+            Logger::error("Error getting transaction history: " . $e->getMessage());
+            return "❌ Could not load transaction history. Please try again later.\n\nSend 'menu' to go back.";
+        }
+    }
+    
+    /**
+     * Get status icon for transaction
+     */
+    private function getStatusIcon($status) {
+        switch ($status) {
+            case 'success': return '✅';
+            case 'failed': return '❌';
+            case 'pending': return '⏳';
+            case 'cancelled': return '🚫';
+            default: return '❓';
+        }
+    }
+    
+    /**
+     * Show user profile
+     */
+    private function showProfile() {
+        try {
+            // Get transaction statistics
+            $stmt = $this->db->prepare("
+                SELECT 
+                    COUNT(*) as total_transactions,
+                    SUM(CASE WHEN status = 'success' THEN amount ELSE 0 END) as total_spent,
+                    SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as successful_transactions
+                FROM transactions 
+                WHERE user_id = ?
+            ");
+            $stmt->execute([$this->user['id']]);
+            $stats = $stmt->fetch();
+            
+            $response = "👤 *Your Profile*\n\n";
+            $response .= "📞 *Phone:* " . $this->user['phone_number'] . "\n";
+            
+            if ($this->user['first_name'] || $this->user['last_name']) {
+                $name = trim(($this->user['first_name'] ?? '') . ' ' . ($this->user['last_name'] ?? ''));
+                $response .= "🏷️ *Name:* " . $name . "\n";
+            }
+            
+            $response .= "📅 *Member Since:* " . date('M d, Y', strtotime($this->user['registration_date'])) . "\n";
+            $response .= "🕐 *Last Active:* " . date('M d, Y H:i', strtotime($this->user['last_activity'])) . "\n\n";
+            
+            $response .= "📊 *Your Statistics:*\n";
+            $response .= "• Total Transactions: " . ($stats['total_transactions'] ?? 0) . "\n";
+            $response .= "• Successful: " . ($stats['successful_transactions'] ?? 0) . "\n";
+            $response .= "• Total Spent: " . Utils::formatCurrency($stats['total_spent'] ?? 0) . "\n\n";
+            
+            // Get saved numbers count
+            $savedNumbers = $this->getCustomerNumbers($this->user['id']);
+            $response .= "📱 *Saved Numbers:* " . count($savedNumbers) . "\n\n";
+            
+            $response .= "Need to update your profile? Contact support.\n\n";
+            $response .= "Send 'menu' to go back 🏠";
+            
+            return $response;
+            
+        } catch (Exception $e) {
+            Logger::error("Error getting user profile: " . $e->getMessage());
+            return "❌ Could not load profile. Please try again later.\n\nSend 'menu' to go back.";
+        }
+    }
+    
+    /**
+     * Get support information
+     */
+    private function getSupport() {
+        $supportPhone = $this->config->get('support_phone_number', ADMIN_PHONE);
+        
+        $response = "🆘 *LycaPay Support*\n\n";
+        $response .= "Need help? We're here for you!\n\n";
+        $response .= "📞 *Phone:* " . $supportPhone . "\n";
+        $response .= "📧 *Email:* " . ADMIN_EMAIL . "\n\n";
+        $response .= "🕒 *Support Hours:*\n";
+        $response .= "Monday - Friday: 8:00 AM - 6:00 PM\n";
+        $response .= "Saturday: 9:00 AM - 4:00 PM\n";
+        $response .= "Sunday: Closed\n\n";
+        $response .= "💡 *Common Issues:*\n";
+        $response .= "• Transaction failed? We'll help you resolve it\n";
+        $response .= "• Wrong number recharged? Contact us immediately\n";
+        $response .= "• Balance questions? We can check for you\n\n";
+        $response .= "When contacting support, please provide your transaction ID if available.\n\n";
+        $response .= "Send 'menu' to go back 🏠";
+        
+        return $response;
+    }
+    
+    /**
+     * Handle direct number input
+     */
+    private function handleDirectNumber($phoneNumber) {
+        try {
+            $formattedNumber = Utils::formatPhoneNumber($phoneNumber);
+            
+            // Get subscriber info
+            $lycaApi = new LycaMobileAPI();
+            $subscriberInfo = $lycaApi->getSubscriptionInfo($formattedNumber);
+            
+            if ($subscriberInfo && isset($subscriberInfo['subscriberName'])) {
+                $subscriberName = trim($subscriberInfo['subscriberName'] . ' ' . ($subscriberInfo['subscriberSurname'] ?? ''));
+                
+                // Save customer number for future use
+                $this->saveCustomerNumber($this->user['id'], $formattedNumber, $subscriberName);
+                
+                $response = "📱 *Subscriber Information*\n\n";
+                $response .= "📞 *Number:* " . $formattedNumber . "\n";
+                $response .= "👤 *Name:* " . $subscriberName . "\n";
+                $response .= "📊 *Status:* " . ($subscriberInfo['status'] ?? 'Active') . "\n\n";
+                $response .= "What would you like to do?\n\n";
+                $response .= "1️⃣ Buy Data Bundle\n";
+                $response .= "2️⃣ Buy Airtime\n";
+                $response .= "3️⃣ Back to Menu\n\n";
+                $response .= "Send your choice (1, 2, or 3)";
+                
+                $this->updateSession($this->user['id'], 'number_selected', 'quick_action', [
+                    'selected_number' => $formattedNumber,
+                    'subscriber_name' => $subscriberName
+                ]);
+                
+                return $response;
+            } else {
+                return "❓ Could not find subscriber information for " . $formattedNumber . "\n\n" .
+                       "This number might be:\n" .
+                       "• Not a Lycamobile number\n" .
+                       "• Inactive or suspended\n" .
+                       "• Invalid format\n\n" .
+                       "Please check the number and try again, or send 'menu' to go back.";
+            }
+        } catch (Exception $e) {
+            Logger::error("Error handling direct number: " . $e->getMessage());
+            return "❌ Could not check subscriber information. Please try again or contact support.\n\nSend 'menu' to go back.";
+        }
+    }
+    
+    /**
+     * Get unknown command response
+     */
+    private function getUnknownCommandResponse() {
+        $responses = [
+            "❓ I didn't understand that command.\n\nSend 'menu' to see available options.",
+            "🤔 Not sure what you mean.\n\nTry sending 'help' or 'menu' to get started.",
+            "❓ Invalid command.\n\nSend 'menu' to see what I can help you with.",
+        ];
+        
+        return $responses[array_rand($responses)];
+    }
+}
+
+?>
