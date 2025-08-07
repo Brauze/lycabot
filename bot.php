@@ -18,7 +18,7 @@ class LycaPayBot {
         $this->debugLog("LycaPay Bot constructor called");
         
         try {
-            $this->pdo = getDBConnection();
+            $this->pdo = Config::getInstance()->getDatabase();
             $this->debugLog("Database connection established");
         } catch (Exception $e) {
             $this->debugLog("Database connection failed: " . $e->getMessage(), 'ERROR');
@@ -1385,3 +1385,4 @@ class LycaPayBot {
 }
 
 ?>
+
