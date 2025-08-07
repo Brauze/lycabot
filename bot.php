@@ -1,6 +1,6 @@
 <?php
 /**
- * LycaPay WhatsApp Bot - Standalone Version (No Composer Dependencies)
+ * LycaPay WhatsApp Bot - Fixed for TwiML Response Version
  * Handles all bot interactions and business logic
  */
 
@@ -8,7 +8,6 @@ require_once 'config.php';
 require_once 'lyca_api.php';
 
 Logger::info("Logger test message", ['file' => __FILE__, 'time' => date('Y-m-d H:i:s')]);
-
 
 class LycaPayBot {
     private $pdo;
@@ -36,7 +35,7 @@ class LycaPayBot {
     }
     
     /**
-     * Process incoming WhatsApp message
+     * Process incoming WhatsApp message and return TwiML response
      */
     public function handleIncomingMessage($from, $body) {
         $this->debugLog("handleIncomingMessage called - From: $from, Body: $body");
@@ -54,29 +53,24 @@ class LycaPayBot {
             $this->loadUserState($phone);
             $this->debugLog("User state loaded");
             
-            // Process message
+            // Process message and get response
             $response = $this->processMessage($body);
             $this->debugLog("Message processed - Response: " . substr($response, 0, 100) . "...");
-            
-            // Send response
-            $this->sendMessage($phone, $response);
-            $this->debugLog("Response sent");
             
             // Log messages
             $this->logMessage($phone, 'incoming', $body);
             $this->logMessage($phone, 'outgoing', $response);
             $this->debugLog("Messages logged");
             
+            // Return the response message (webhook.php will handle TwiML)
+            return $response;
+            
         } catch (Exception $e) {
             $this->debugLog("Error in handleIncomingMessage: " . $e->getMessage(), 'ERROR');
             $this->debugLog("Stack trace: " . $e->getTraceAsString(), 'ERROR');
             
-            // Try to send error message
-            try {
-                $this->sendMessage($phone ?? $from, $this->getErrorMessage());
-            } catch (Exception $sendError) {
-                $this->debugLog("Failed to send error message: " . $sendError->getMessage(), 'ERROR');
-            }
+            // Return error message
+            return $this->getErrorMessage();
         }
     }
     
@@ -181,80 +175,15 @@ class LycaPayBot {
             case 'number_selected':
                 return $this->handleNumberSelectedAction($originalMessage, $data);
                 
+            case 'selecting_bundle_for_number':
+                return $this->handleBundleSelectionForNumber($originalMessage, $data);
+                
+            case 'entering_amount_for_number':
+                return $this->handleAmountInputForNumber($originalMessage, $data);
+                
             default:
                 $this->clearUserState();
                 return "❌ Something went wrong. Please start over by sending 'menu'.";
-        }
-    }
-    
-    private function sendMessage($to, $message) {
-        $this->debugLog("Attempting to send message to: $to");
-        $this->debugLog("Message content: " . substr($message, 0, 200) . "...");
-        
-        try {
-            // Ensure proper WhatsApp format
-            if (!str_starts_with($to, 'whatsapp:')) {
-                $to = 'whatsapp:' . $to;
-            }
-            
-            $this->debugLog("Sending via Twilio API to: $to");
-            
-            // Use cURL instead of Twilio SDK
-            $success = $this->sendTwilioMessage($to, $message);
-            
-            if ($success) {
-                $this->debugLog("Message sent successfully");
-            } else {
-                $this->debugLog("Failed to send message", 'ERROR');
-            }
-            
-        } catch (Exception $e) {
-            $this->debugLog("Failed to send message: " . $e->getMessage(), 'ERROR');
-            throw $e;
-        }
-    }
-    
-    private function sendTwilioMessage($to, $body) {
-        $accountSid = TWILIO_ACCOUNT_SID;
-        $authToken = TWILIO_AUTH_TOKEN;
-        $from = TWILIO_WHATSAPP_NUMBER;
-        
-        $url = "https://api.twilio.com/2010-04-01/Accounts/$accountSid/Messages.json";
-        
-        $data = [
-            'From' => $from,
-            'To' => $to,
-            'Body' => $body
-        ];
-        
-        $ch = curl_init();
-        curl_setopt($ch, CURLOPT_URL, $url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_POST, true);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($data));
-        curl_setopt($ch, CURLOPT_USERPWD, "$accountSid:$authToken");
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            'Content-Type: application/x-www-form-urlencoded'
-        ]);
-        
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        
-        if (curl_error($ch)) {
-            $this->debugLog("cURL error: " . curl_error($ch), 'ERROR');
-            curl_close($ch);
-            return false;
-        }
-        
-        curl_close($ch);
-        
-        $this->debugLog("Twilio API response (HTTP $httpCode): $response");
-        
-        if ($httpCode >= 200 && $httpCode < 300) {
-            return true;
-        } else {
-            $this->debugLog("Twilio API error: HTTP $httpCode - $response", 'ERROR');
-            return false;
         }
     }
     
@@ -455,6 +384,28 @@ class LycaPayBot {
     }
     
     /**
+     * Handle bundle selection for specific number
+     */
+    private function handleBundleSelectionForNumber($input, $data) {
+        if (strtolower($input) === 'menu' || strtolower($input) === 'cancel') {
+            $this->clearUserState();
+            return $this->getMainMenu();
+        }
+        
+        $plans = $data['plans'] ?? [];
+        $selectedNumber = (int)$input - 1;
+        $phoneNumber = $data['selected_number'];
+        $subscriberName = $data['subscriber_name'] ?? '';
+        
+        if ($selectedNumber >= 0 && $selectedNumber < count($plans)) {
+            $selectedPlan = $plans[$selectedNumber];
+            return $this->confirmBundlePurchase($selectedPlan, $phoneNumber, $subscriberName);
+        } else {
+            return "❌ Invalid selection. Please choose a number between 1 and " . count($plans) . "\n\nSend 'cancel' to go back.";
+        }
+    }
+    
+    /**
      * Handle number input
      */
     private function handleNumberInput($input, $data) {
@@ -488,17 +439,20 @@ class LycaPayBot {
     /**
      * Confirm bundle purchase
      */
-    private function confirmBundlePurchase($plan, $phoneNumber) {
+    private function confirmBundlePurchase($plan, $phoneNumber, $subscriberName = '') {
         try {
-            // Get subscriber info
-            $lycaApi = new LycaMobileAPI();
-            $subscriberInfo = $lycaApi->getSubscriptionInfo($phoneNumber);
-            
-            $subscriberName = '';
-            if ($subscriberInfo && isset($subscriberInfo['subscriberName'])) {
-                $subscriberName = trim($subscriberInfo['subscriberName'] . ' ' . ($subscriberInfo['subscriberSurname'] ?? ''));
+            // Get subscriber info if not provided
+            if (!$subscriberName) {
+                $lycaApi = new LycaMobileAPI();
+                $subscriberInfo = $lycaApi->getSubscriptionInfo($phoneNumber);
                 
-                // Save customer number for future use
+                if ($subscriberInfo && isset($subscriberInfo['subscriberName'])) {
+                    $subscriberName = trim($subscriberInfo['subscriberName'] . ' ' . ($subscriberInfo['subscriberSurname'] ?? ''));
+                }
+            }
+            
+            // Save customer number for future use
+            if ($subscriberName) {
                 $this->saveCustomerNumber($this->currentUser['id'], $phoneNumber, $subscriberName);
             }
             
@@ -707,6 +661,32 @@ class LycaPayBot {
             
             return $response;
         }
+    }
+    
+    /**
+     * Handle amount input for specific number
+     */
+    private function handleAmountInputForNumber($input, $data) {
+        if (strtolower($input) === 'cancel') {
+            $this->clearUserState();
+            return "❌ Operation cancelled. Send 'menu' to start over.";
+        }
+        
+        // Extract numeric value
+        $amount = (int)preg_replace('/[^0-9]/', '', $input);
+        
+        if ($amount < 500) { // Min amount
+            return "❌ Minimum airtime amount is UGX 500\n\nPlease enter a valid amount or send 'cancel' to abort.";
+        }
+        
+        if ($amount > 100000) { // Max 100k for safety
+            return "❌ Maximum airtime amount is UGX 100,000 per transaction.\n\nPlease enter a valid amount or send 'cancel' to abort.";
+        }
+        
+        $phoneNumber = $data['selected_number'];
+        $subscriberName = $data['subscriber_name'] ?? '';
+        
+        return $this->confirmAirtimePurchase($amount, $phoneNumber, $subscriberName);
     }
     
     /**
@@ -972,8 +952,6 @@ class LycaPayBot {
         return $response;
     }
     
-    // Additional helper methods
-    
     /**
      * Handle saved number selection
      */
@@ -1022,17 +1000,20 @@ class LycaPayBot {
     /**
      * Confirm airtime purchase
      */
-    private function confirmAirtimePurchase($amount, $phoneNumber) {
+    private function confirmAirtimePurchase($amount, $phoneNumber, $subscriberName = '') {
         try {
-            // Get subscriber info
-            $lycaApi = new LycaMobileAPI();
-            $subscriberInfo = $lycaApi->getSubscriptionInfo($phoneNumber);
-            
-            $subscriberName = '';
-            if ($subscriberInfo && isset($subscriberInfo['subscriberName'])) {
-                $subscriberName = trim($subscriberInfo['subscriberName'] . ' ' . ($subscriberInfo['subscriberSurname'] ?? ''));
+            // Get subscriber info if not provided
+            if (!$subscriberName) {
+                $lycaApi = new LycaMobileAPI();
+                $subscriberInfo = $lycaApi->getSubscriptionInfo($phoneNumber);
                 
-                // Save customer number for future use
+                if ($subscriberInfo && isset($subscriberInfo['subscriberName'])) {
+                    $subscriberName = trim($subscriberInfo['subscriberName'] . ' ' . ($subscriberInfo['subscriberSurname'] ?? ''));
+                }
+            }
+            
+            // Save customer number for future use
+            if ($subscriberName) {
                 $this->saveCustomerNumber($this->currentUser['id'], $phoneNumber, $subscriberName);
             }
             
@@ -1295,7 +1276,11 @@ class LycaPayBot {
     /**
      * Get error message for error code
      */
-    private function getErrorMessage($errorCode) {
+    private function getErrorMessage($errorCode = null) {
+        if (!$errorCode) {
+            return "Sorry, I'm experiencing technical difficulties. Please try again in a moment or contact support if the issue persists.";
+        }
+        
         $errorMessages = [
             'INSUFFICIENT_BALANCE' => 'Insufficient wallet balance',
             'INVALID_NUMBER' => 'Invalid phone number',
@@ -1306,7 +1291,7 @@ class LycaPayBot {
             'INVALID_BUNDLE' => 'Invalid bundle selected'
         ];
         
-        return $errorMessages[$errorCode] ?? 'Unknown error occurred';
+        return $errorMessages[$errorCode] ?? 'An unexpected error occurred';
     }
     
     /**
@@ -1322,7 +1307,6 @@ class LycaPayBot {
         return $responses[array_rand($responses)];
     }
     
-       
     // State management methods
     
     /**
@@ -1361,6 +1345,11 @@ class LycaPayBot {
      * Save user state to file
      */
     private function saveUserState() {
+        if (!isset($this->currentUser['phone_number'])) {
+            $this->debugLog("Cannot save user state - no phone number available", 'ERROR');
+            return;
+        }
+        
         $stateDir = "lycapay_user_states";
         if (!file_exists($stateDir)) {
             mkdir($stateDir, 0755, true);
