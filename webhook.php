@@ -1,74 +1,48 @@
 <?php
-/**
- * LycaPay WhatsApp Bot Webhook Handler
- * Handles incoming WhatsApp messages from Twilio
- */
+// webhook.php Ã¢â‚¬â€ Live bot-enabled WhatsApp handler with fallback response
 
-define('LYCAPAY_BOT', true);
+// Log raw input
+file_put_contents(__DIR__ . '/log.txt', date('Y-m-d H:i:s') . " - POST: " . json_encode($_POST) . PHP_EOL, FILE_APPEND);
+
 require_once 'config.php';
-require_once 'bot.php';
+require_once 'bot.php'; // Make sure this contains LycaPayBot and its logic
 
-// Set headers for proper response
-header('Content-Type: application/xml; charset=utf-8');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: POST, GET, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type, X-Twilio-Signature');
-
-// Handle preflight OPTIONS request
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(200);
+// Ensure POST method
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
+    echo "Method not allowed";
     exit;
 }
 
-try {
-    // Log the incoming request for debugging
-    $rawInput = file_get_contents('php://input');
-    $allHeaders = function_exists('getallheaders') ? getallheaders() : [];
-    
-    Logger::info("Webhook received", [
-        'method' => $_SERVER['REQUEST_METHOD'],
-        'headers' => $allHeaders,
-        'post' => $_POST,
-        'get' => $_GET,
-        'raw_input' => $rawInput,
-        'content_type' => $_SERVER['CONTENT_TYPE'] ?? 'not set'
-    ]);
-    
-    // Validate Twilio signature for security in production
-    if (ENVIRONMENT === 'production') {
-        $isValid = validateTwilioSignature();
-        if (!$isValid) {
-            Logger::warning("Invalid Twilio signature", [
-                'expected_sig' => $_SERVER['HTTP_X_TWILIO_SIGNATURE'] ?? 'missing',
-                'url' => getCurrentUrl()
-            ]);
-            http_response_code(403);
-            echo '<?xml version="1.0" encoding="UTF-8"?><Response><Message>Unauthorized</Message></Response>';
-            exit;
-        }
-    }
-    
-    // Handle different request methods
-    switch ($_SERVER['REQUEST_METHOD']) {
-        case 'GET':
-            handleGetRequest();
-            break;
-        case 'POST':
-            handleIncomingMessage();
-            break;
-        default:
-            Logger::warning("Unsupported HTTP method: " . $_SERVER['REQUEST_METHOD']);
-            http_response_code(405);
-            echo '<?xml version="1.0" encoding="UTF-8"?><Response><Message>Method not allowed</Message></Response>';
-    }
-    
-} catch (Exception $e) {
-    Logger::error("Webhook error: " . $e->getMessage(), [
-        'trace' => $e->getTraceAsString(),
-        'file' => $e->getFile(),
-        'line' => $e->getLine()
-    ]);
-    
-    http_response_code(500);
-    echo '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+$data = $_POST;
+$from = isset($data['From']) ? str_replace('whatsapp:', '', $data['From']) : null;
+$body = isset($data['Body']) ? trim($data['Body']) : null;
+
+if (!$from || !$body) {
+    http_response_code(400);
+    echo "Missing 'From' or 'Body'";
+    exit;
 }
+
+$responseText = "Sorry, we couldn't process your request.";
+
+try {
+    $bot = new LycaPayBot();
+    // Pass true to $returnOnly to get the response directly
+    $responseText = $bot->handleIncomingMessage($from, $body, true);
+
+    if (!$responseText) {
+        $responseText = "Thanks, we got your message.";
+    }
+} catch (Exception $e) {
+    file_put_contents(__DIR__ . '/error_log.txt', date('Y-m-d H:i:s') . " - Bot Error: " . $e->getMessage() . PHP_EOL, FILE_APPEND);
+    $responseText = $bot->getErrorMessage(); // Use the error message from the bot
+}
+
+// Send valid TwiML response
+header('Content-Type: text/xml');
+echo '<?xml version="1.0" encoding="UTF-8"?>';
+echo '<Response>';
+echo '<Message>' . htmlspecialchars($responseText) . '</Message>';
+echo '</Response>';
+exit;
